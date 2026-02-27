@@ -1,105 +1,105 @@
 # services/sequence_engine.py
+# Replaced SQLAlchemy ORM with database/db.py functions
+
 from datetime import datetime, timedelta
-from database.models import EmailRecord, EmailStatus, Lead
-from database.session import get_db_session
-from services.suppression import is_suppressed
+from database.db import (
+    db_get_lead_by_id,
+    db_bulk_create_email_records,
+    db_check_lead_replied_in_campaign,
+    db_get_previous_step_record,
+    db_is_suppressed,
+)
 import random
 import uuid
 
-# How many days after campaign launch each step is sent
 SEQUENCE_DELAYS = {
-    1: (0, 0),      # Immediately
-    2: (3, 5),      # Day 3–5
-    3: (7, 9),      # Day 7–9
-    4: (12, 15),    # Day 12–15
-    5: (18, 21),    # Day 18–21
+    1: (0, 0),
+    2: (3, 5),
+    3: (7, 9),
+    4: (12, 15),
+    5: (18, 21),
 }
 
 
 def enqueue_campaign_sequence(campaign_id: str, lead_ids: list) -> dict:
     """
-    Create PENDING EmailRecord rows for every lead x every step.
-    Celery picks these up and sends them at the scheduled time.
+    Build all email records for every lead x every step and bulk insert them.
+    Much faster than inserting one by one.
     """
-    db = get_db_session()
-    queued = 0
+    records_to_insert = []
     skipped = 0
 
-    try:
-        for lead_id in lead_ids:
-            lead = db.query(Lead).get(lead_id)
-            if not lead or not lead.email:
-                skipped += 1
-                continue
+    for lead_id in lead_ids:
+        lead = db_get_lead_by_id(lead_id)
+        if not lead or not lead.get("email"):
+            skipped += 1
+            continue
 
-            if is_suppressed(lead.email, db):
-                skipped += 1
-                continue
+        if db_is_suppressed(lead["email"]):
+            skipped += 1
+            continue
 
-            for step, (min_days, max_days) in SEQUENCE_DELAYS.items():
-                delay_days  = random.randint(min_days, max_days)
-                send_hour   = random.randint(9, 11)    # 9am–11am
-                send_minute = random.randint(0, 55)
+        for step, (min_days, max_days) in SEQUENCE_DELAYS.items():
+            delay_days  = random.randint(min_days, max_days)
+            send_hour   = random.randint(9, 11)
+            send_minute = random.randint(0, 55)
 
-                scheduled_at = (
-                    datetime.utcnow()
-                    + timedelta(days=delay_days)
-                ).replace(hour=send_hour, minute=send_minute, second=0, microsecond=0)
+            scheduled_at = (
+                datetime.utcnow() + timedelta(days=delay_days)
+            ).replace(
+                hour=send_hour,
+                minute=send_minute,
+                second=0,
+                microsecond=0,
+            )
 
-                record = EmailRecord(
-                    id=str(uuid.uuid4()),
-                    campaign_id=campaign_id,
-                    lead_id=lead_id,
-                    sequence_step=step,
-                    status=EmailStatus.PENDING,
-                    scheduled_at=scheduled_at,
-                )
-                db.add(record)
-                queued += 1
+            records_to_insert.append({
+                "id":            str(uuid.uuid4()),
+                "campaign_id":   campaign_id,
+                "lead_id":       lead_id,
+                "sequence_step": step,
+                "status":        "pending",
+                "scheduled_at":  scheduled_at.isoformat(),
+            })
 
-        db.commit()
-        print(f"Sequence queued: {queued} emails, {skipped} leads skipped")
-        return {"queued": queued, "skipped": skipped}
+    queued = 0
+    if records_to_insert:
+        # Bulk insert all at once — one HTTPS call instead of N calls
+        db_bulk_create_email_records(records_to_insert)
+        queued = len(records_to_insert)
 
-    finally:
-        db.close()
+    print(f"Sequence queued: {queued} emails, {skipped} leads skipped")
+    return {"queued": queued, "skipped": skipped}
 
 
-def should_send_email(record: EmailRecord, db) -> tuple:
+def should_send_email(record: dict) -> tuple:
     """
-    Final check before sending each email.
-    Returns (True, None) or (False, reason_string)
+    Final pre-send checks.
+    Returns (True, None) if safe to send, (False, reason) if not.
+    record is now a plain dict (from Supabase) not an ORM object.
     """
+    lead_email = record.get("lead_email") or _get_lead_email(record["lead_id"])
 
-    # 1. Suppressed
-    if is_suppressed(record.lead.email, db):
+    if not lead_email:
+        return False, "no_lead_email"
+
+    if db_is_suppressed(lead_email):
         return False, "suppressed"
 
-    # 2. Lead already replied to this campaign — stop the sequence
-    already_replied = (
-        db.query(EmailRecord)
-        .filter(
-            EmailRecord.lead_id    == record.lead_id,
-            EmailRecord.campaign_id == record.campaign_id,
-            EmailRecord.status     == EmailStatus.REPLIED,
-        )
-        .first()
-    )
-    if already_replied:
+    if db_check_lead_replied_in_campaign(record["lead_id"], record["campaign_id"]):
         return False, "lead_already_replied"
 
-    # 3. Previous step bounced — don't keep trying
-    if record.sequence_step > 1:
-        prev = (
-            db.query(EmailRecord)
-            .filter(
-                EmailRecord.lead_id       == record.lead_id,
-                EmailRecord.campaign_id   == record.campaign_id,
-                EmailRecord.sequence_step == record.sequence_step - 1,
-            )
-            .first()
-        )
-        if prev and prev.status == EmailStatus.BOUNCED:
+    step = record.get("sequence_step", 1)
+    if step > 1:
+        prev = db_get_previous_step_record(record["lead_id"], record["campaign_id"], step)
+        if prev and prev.get("status") == "bounced":
             return False, "previous_step_bounced"
 
     return True, None
+
+
+def _get_lead_email(lead_id: str) -> str:
+    """Helper to get lead email when it's not already on the record"""
+    from database.db import db_get_lead_by_id
+    lead = db_get_lead_by_id(lead_id)
+    return lead.get("email", "") if lead else ""

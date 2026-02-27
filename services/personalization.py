@@ -1,9 +1,13 @@
 # services/personalization.py
+# Updated for Supabase REST migration:
+# - lead and campaign are now plain dicts (not SQLAlchemy ORM objects)
+# - Access data with lead["field"] instead of lead.field
+# - Everything else (Gemini logic, prompts, validation) stays identical
+
 import google.generativeai as genai
 import json
 import re
 from config import settings
-from database.models import Lead, Campaign
 
 genai.configure(api_key=settings.gemini_api_key)
 
@@ -39,50 +43,69 @@ def validate_email_output(body: str) -> bool:
     for phrase in BANNED_PHRASES:
         if phrase in body_lower:
             return False
-    if "{{" in body or "}}" in body:   # unfilled template tokens
+    if "{{" in body or "}}" in body:  # unfilled template tokens
         return False
-    if len(body) < 150:                 # too short
+    if len(body) < 150:               # too short
         return False
     return True
 
 
 def generate_personalized_email(
-    lead: Lead,
-    campaign: Campaign,
+    lead: dict,           # ← plain dict from Supabase, was ORM object
+    campaign: dict,       # ← plain dict from Supabase, was ORM object
     sequence_step: int,
     previous_subjects: list = None,
 ) -> dict:
-    """Generate a unique email for this lead at this sequence step"""
+    """
+    Generate a unique personalized email for this lead at this sequence step.
+
+    lead and campaign are plain dicts — access with lead["field"] or lead.get("field")
+    Returns: {"subject": "...", "body": "..."}
+    """
 
     prev_context = ""
     if previous_subjects:
         prev_context = (
-            f"\nPrevious subject lines sent to this person: {', '.join(previous_subjects)}"
+            f"\nPrevious subject lines already sent to this person: {', '.join(previous_subjects)}"
             "\nDo NOT repeat the same angle or hook."
         )
 
-    unsubscribe_url = f"{settings.unsubscribe_base_url}?email={lead.email}"
+    # ── Pull lead fields from dict ────────────────────────────────────────────
+    first_name      = lead.get("first_name") or "there"
+    business_name   = lead.get("business_name") or "their business"
+    industry        = lead.get("industry") or "not specified"
+    location        = lead.get("location") or "not specified"
+    website         = lead.get("website") or "none"
+    specifications  = lead.get("specifications") or "none"
+    source_platform = lead.get("source_platform") or "online research"
+    lead_email      = lead.get("email", "")
+
+    # ── Pull campaign fields from dict ────────────────────────────────────────
+    campaign_name   = campaign.get("name", "Outreach Campaign")
+    body_template   = campaign.get("body_template", "")
+
+    unsubscribe_url = f"{settings.unsubscribe_base_url}?email={lead_email}"
 
     prompt = f"""You write cold outreach emails for a digital agency that builds AI automation systems.
 
 Write ONE email now for this recipient:
 
 RECIPIENT INFO:
-- First name: {lead.first_name or 'there'}
-- Business name: {lead.business_name or 'their business'}
-- Industry: {lead.industry or 'not specified'}
-- Location: {lead.location or 'not specified'}
-- Website: {lead.website or 'none'}
-- Extra notes: {lead.specifications or 'none'}
-- Found via: {lead.source_platform or 'online research'}
+- First name: {first_name}
+- Business name: {business_name}
+- Industry: {industry}
+- Location: {location}
+- Website: {website}
+- Extra notes: {specifications}
+- Found via: {source_platform}
 
-CAMPAIGN: {campaign.name}
+CAMPAIGN: {campaign_name}
 EMAIL STEP: {sequence_step} of 5
 GUIDANCE FOR THIS STEP: {STEP_GUIDANCE[sequence_step]}
 {prev_context}
 
 BASE TEMPLATE (rewrite completely in your own words — do not copy):
-{campaign.body_template}
+{body_template}
 
 STRICT RULES:
 1. Never start with "I hope this email finds you well" or any variant
@@ -111,14 +134,19 @@ RESPOND with ONLY a valid JSON object in this exact format — no explanation, n
 
     if not validate_email_output(result.get("body", "")):
         raise ValueError(
-            f"Generated email failed validation for lead {lead.id} at step {sequence_step}"
+            f"Generated email failed validation for "
+            f"lead {lead.get('id')} at step {sequence_step}"
         )
 
     return result
 
 
 def classify_reply(text: str) -> str:
-    """Use Gemini Flash to classify an inbound reply — fast and cheap"""
+    """
+    Use Gemini Flash to classify an inbound reply.
+    Returns one of: interested | question | objection |
+                    out_of_office | unsubscribe | negative | unknown
+    """
 
     prompt = f"""Classify this email reply into exactly ONE of these categories:
 
@@ -151,9 +179,16 @@ def generate_reply_response(
     original_email: str,
     reply_content: str,
     reply_category: str,
-    lead: Lead,
+    lead: dict,           # ← plain dict from Supabase, was ORM object
 ) -> str:
-    """Generate a human-sounding response to an inbound reply"""
+    """
+    Generate a human-sounding response to an inbound reply.
+    lead is a plain dict — access with lead.get("field")
+    """
+
+    # ── Pull lead fields from dict ────────────────────────────────────────────
+    first_name    = lead.get("first_name") or "there"
+    business_name = lead.get("business_name") or "their company"
 
     guidance = {
         "interested": (
@@ -174,7 +209,7 @@ def generate_reply_response(
 
 A potential client has replied to your outreach email.
 
-LEAD: {lead.first_name or 'them'} at {lead.business_name or 'their company'}
+LEAD: {first_name} at {business_name}
 THEIR REPLY: {reply_content[:800]}
 REPLY TYPE: {reply_category}
 YOUR GOAL: {guidance.get(reply_category, 'Respond naturally and helpfully.')}

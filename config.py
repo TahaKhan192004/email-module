@@ -6,9 +6,9 @@ from functools import lru_cache
 class Settings(BaseSettings):
     # Supabase
     supabase_url: str
-    supabase_anon_key: str
+    
     supabase_service_key: str
-    database_url: str
+    
 
     # Redis / Celery
     redis_url: str
