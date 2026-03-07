@@ -755,4 +755,4 @@ That's it — the rest of the system is already built for scale.
 ---
 
 *Last updated: February 2026*
-*Server: AWS EC2 · 3.128.179.239 · Ubuntu 22.04*
+*Server: AWS EC2 ·  · Ubuntu 22.04*
